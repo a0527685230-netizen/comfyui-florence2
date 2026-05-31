@@ -1,4 +1,4 @@
-FROM registry.runpod.net/runpod-workers-worker-comfyui-main-dockerfile:d2a557235
+FROM runpod/worker-comfyui:latest
 
 RUN pip install timm einops "transformers>=4.41.0" --quiet
 
