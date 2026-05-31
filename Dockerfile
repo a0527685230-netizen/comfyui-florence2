@@ -12,7 +12,7 @@ RUN git clone https://github.com/comfyanonymous/ComfyUI.git . && \
 
 RUN git clone --depth=1 https://github.com/kijai/ComfyUI-Florence2.git \
     /comfyui/custom_nodes/ComfyUI-Florence2 && \
-    pip install timm einops "transformers>=4.41.0" --quiet && \
+    pip install timm einops "transformers>=4.41.0" supervision --quiet && \
     (pip install -r /comfyui/custom_nodes/ComfyUI-Florence2/requirements.txt --quiet || true)
 
 RUN pip install runpod requests --quiet
