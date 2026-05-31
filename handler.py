@@ -1,8 +1,10 @@
 import runpod, json, time, base64, requests, uuid
-import sys, traceback as tb
+import sys, traceback as tb, os
 
-# ===== FLORENCE2 DIAGNOSTIC =====
-print("[DIAG] Testing Florence2...")
+COMFYUI_URL = "http://127.0.0.1:8188"
+
+# ===== בדיקת Florence2 בזמן אתחול =====
+_diag_result = ""
 try:
     import importlib.util
     spec = importlib.util.spec_from_file_location(
@@ -10,13 +12,10 @@ try:
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     nodes = list(getattr(mod, 'NODE_CLASS_MAPPINGS', {}).keys())
-    print(f"[DIAG] Florence2 SUCCESS: {nodes}")
+    _diag_result = f"SUCCESS: {nodes}"
 except Exception as e:
-    print(f"[DIAG] Florence2 FAILED: {e}")
-    print(f"[DIAG] TRACEBACK:\n{tb.format_exc()}")
-# ===== END DIAGNOSTIC =====
-
-COMFYUI_URL = "http://127.0.0.1:8188"
+    _diag_result = f"FAILED: {e}\n{tb.format_exc()}"
+# ====================================
 
 def upload_image(image_data, filename):
     img_bytes = base64.b64decode(image_data)
@@ -61,6 +60,12 @@ def get_images(prompt_id):
 
 def handler(job):
     job_input = job["input"]
+
+    # ===== אם זו בקשת אבחון — החזר את תוצאת הבדיקה =====
+    if job_input.get("diagnostic"):
+        return {"diagnostic": _diag_result}
+    # ====================================================
+
     workflow = job_input.get("workflow")
     images_input = job_input.get("images", [])
     if not workflow:
