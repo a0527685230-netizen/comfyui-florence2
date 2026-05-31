@@ -1,4 +1,20 @@
 import runpod, json, time, base64, requests, uuid
+import sys, traceback as tb
+
+# ===== FLORENCE2 DIAGNOSTIC =====
+print("[DIAG] Testing Florence2...")
+try:
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        'f2', '/comfyui/custom_nodes/ComfyUI-Florence2/__init__.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    nodes = list(getattr(mod, 'NODE_CLASS_MAPPINGS', {}).keys())
+    print(f"[DIAG] Florence2 SUCCESS: {nodes}")
+except Exception as e:
+    print(f"[DIAG] Florence2 FAILED: {e}")
+    print(f"[DIAG] TRACEBACK:\n{tb.format_exc()}")
+# ===== END DIAGNOSTIC =====
 
 COMFYUI_URL = "http://127.0.0.1:8188"
 
