@@ -98,10 +98,11 @@ class ImageEdit:
         )
         self.f2_model = AutoModelForCausalLM.from_pretrained(
             "microsoft/Florence-2-base",
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
             trust_remote_code=True,
             cache_dir="/models/florence2",
             token=hf_token,
+            attn_implementation="eager",
         ).to("cuda")
 
         print("Loading Flux Fill...")
