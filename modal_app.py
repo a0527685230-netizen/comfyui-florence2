@@ -118,6 +118,7 @@ class ImageEdit:
 
     def _get_mask(self, image, object_text):
         import torch
+        import numpy as np
         from PIL import Image as PILImage, ImageDraw
 
         task = "<REFERRING_EXPRESSION_SEGMENTATION>"
@@ -126,7 +127,6 @@ class ImageEdit:
             images=image,
             return_tensors="pt"
         ).to("cuda")
-
         inputs["pixel_values"] = inputs["pixel_values"].to(torch.float16)
 
         with torch.no_grad():
@@ -149,6 +149,7 @@ class ImageEdit:
 
         mask = PILImage.new("L", (image.width, image.height), 0)
         draw = ImageDraw.Draw(mask)
+        found = False
 
         if result and task in result:
             for polygon_group in result[task].get("polygons", []):
@@ -156,13 +157,16 @@ class ImageEdit:
                     if len(polygon) >= 6:
                         points = [(polygon[j], polygon[j+1]) for j in range(0, len(polygon), 2)]
                         draw.polygon(points, fill=255)
+                        found = True
+
+        if not found:
+            return None
 
         return mask
 
     @modal.fastapi_endpoint(method="POST")
     def edit(self, body: dict):
         from PIL import Image as PILImage
-        import torch
 
         image_b64 = body.get("image", "")
         object_text = body.get("object", "")
@@ -178,12 +182,13 @@ class ImageEdit:
 
             mask = self._get_mask(image, object_text)
 
+            if mask is None:
+                return {"error": "לא הצלחתי לזהות את האובייקט בתמונה. נסה לתאר אחרת, למשל: 'shirt' במקום 'חולצה'"}
+
             result = self.fill_pipe(
                 prompt=edit_prompt,
                 image=image,
                 mask_image=mask,
-                height=1024,
-                width=1024,
                 guidance_scale=30,
                 num_inference_steps=50,
             ).images[0]
