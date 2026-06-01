@@ -45,7 +45,7 @@ class Bot:
         vol.commit()
         print("Ready!")
 
-    @modal.web_endpoint(method="POST")
+    @modal.fastapi_endpoint(method="POST")
     def generate(self, body: dict):
         prompt = body.get("prompt", "")
         width = body.get("width", 1024)
