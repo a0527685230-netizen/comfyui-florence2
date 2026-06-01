@@ -1,6 +1,7 @@
 import modal
 import io
 import base64
+import os
 
 app = modal.App("telegram-bot")
 
@@ -29,6 +30,7 @@ vol = modal.Volume.from_name("bot-models", create_if_missing=True)
     image=image,
     volumes={"/models": vol},
     timeout=600,
+    secrets=[modal.Secret.from_name("hf-token")],
 )
 class Bot:
 
@@ -41,6 +43,7 @@ class Bot:
             "black-forest-labs/FLUX.1-schnell",
             torch_dtype=torch.bfloat16,
             cache_dir="/models/flux-schnell",
+            token=os.environ.get("HF_TOKEN"),
         )
         self.pipe.enable_model_cpu_offload()
         vol.commit()
