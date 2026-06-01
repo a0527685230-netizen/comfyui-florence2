@@ -2,6 +2,7 @@ import modal
 import io
 import base64
 import os
+import traceback
 
 app = modal.App("telegram-bot")
 
@@ -118,7 +119,6 @@ class ImageEdit:
 
     def _get_mask(self, image, object_text):
         import torch
-        import numpy as np
         from PIL import Image as PILImage, ImageDraw
 
         task = "<REFERRING_EXPRESSION_SEGMENTATION>"
@@ -147,7 +147,7 @@ class ImageEdit:
             image_size=(image.width, image.height),
         )
 
-        mask = PILImage.new("L", (image.width, image.height), 0)
+        mask = PILImage.new("RGB", (image.width, image.height), (0, 0, 0))
         draw = ImageDraw.Draw(mask)
         found = False
 
@@ -156,7 +156,7 @@ class ImageEdit:
                 for polygon in polygon_group:
                     if len(polygon) >= 6:
                         points = [(polygon[j], polygon[j+1]) for j in range(0, len(polygon), 2)]
-                        draw.polygon(points, fill=255)
+                        draw.polygon(points, fill=(255, 255, 255))
                         found = True
 
         if not found:
@@ -180,15 +180,21 @@ class ImageEdit:
                 io.BytesIO(base64.b64decode(image_b64))
             ).convert("RGB").resize((1024, 1024))
 
+            print(f"Image size: {image.size}, mode: {image.mode}")
+
             mask = self._get_mask(image, object_text)
 
             if mask is None:
-                return {"error": "לא הצלחתי לזהות את האובייקט בתמונה. נסה לתאר אחרת, למשל: 'shirt' במקום 'חולצה'"}
+                return {"error": "לא הצלחתי לזהות את האובייקט. נסה באנגלית, למשל: 'background' או 'shirt'"}
+
+            print(f"Mask size: {mask.size}, mode: {mask.mode}")
 
             result = self.fill_pipe(
                 prompt=edit_prompt,
                 image=image,
                 mask_image=mask,
+                height=1024,
+                width=1024,
                 guidance_scale=30,
                 num_inference_steps=50,
             ).images[0]
@@ -198,4 +204,6 @@ class ImageEdit:
             return {"image": base64.b64encode(buf.getvalue()).decode()}
 
         except Exception as e:
-            return {"error": str(e)}
+            tb = traceback.format_exc()
+            print(f"FULL ERROR:\n{tb}")
+            return {"error": str(e), "traceback": tb[-500:]}
