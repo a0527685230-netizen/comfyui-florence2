@@ -18,6 +18,7 @@ image = (
         "Pillow",
         "numpy",
         "huggingface_hub>=0.25.0",
+        "fastapi[standard]",
     ])
 )
 
