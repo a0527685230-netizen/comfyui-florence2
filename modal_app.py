@@ -26,7 +26,7 @@ image = (
 vol = modal.Volume.from_name("bot-models", create_if_missing=True)
 
 @app.cls(
-    gpu="A10G",
+    gpu="A100",
     image=image,
     volumes={"/models": vol},
     timeout=600,
@@ -44,9 +44,7 @@ class Bot:
             torch_dtype=torch.bfloat16,
             cache_dir="/models/flux-schnell",
             token=os.environ.get("HF_TOKEN"),
-        )
-        self.pipe.enable_model_cpu_offload()
-        vol.commit()
+        ).to("cuda")
         print("Ready!")
 
     @modal.fastapi_endpoint(method="POST")
