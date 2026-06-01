@@ -136,6 +136,7 @@ class ImageEdit:
                 pixel_values=inputs["pixel_values"],
                 max_new_tokens=1024,
                 num_beams=3,
+                use_cache=False,
             )
 
         generated_text = self.f2_processor.batch_decode(
@@ -189,10 +190,6 @@ class ImageEdit:
 
             img_np = np.array(pil_image, dtype=np.uint8)
             mask_np = np.array(mask_pil, dtype=np.uint8)
-
-            print(f"img_np shape={img_np.shape} dtype={img_np.dtype}")
-            print(f"mask_np shape={mask_np.shape} dtype={mask_np.dtype}")
-
             clean_image = PILImage.fromarray(img_np)
             clean_mask = PILImage.fromarray(mask_np, mode="L")
 
