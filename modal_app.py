@@ -119,6 +119,7 @@ class ImageEdit:
 
     def _get_mask(self, image, object_text):
         import torch
+        import numpy as np
         from PIL import Image as PILImage, ImageDraw
 
         task = "<REFERRING_EXPRESSION_SEGMENTATION>"
@@ -147,7 +148,7 @@ class ImageEdit:
             image_size=(image.width, image.height),
         )
 
-        mask = PILImage.new("RGB", (image.width, image.height), (0, 0, 0))
+        mask = PILImage.new("L", (image.width, image.height), 0)
         draw = ImageDraw.Draw(mask)
         found = False
 
@@ -156,7 +157,7 @@ class ImageEdit:
                 for polygon in polygon_group:
                     if len(polygon) >= 6:
                         points = [(polygon[j], polygon[j+1]) for j in range(0, len(polygon), 2)]
-                        draw.polygon(points, fill=(255, 255, 255))
+                        draw.polygon(points, fill=255)
                         found = True
 
         if not found:
@@ -166,6 +167,7 @@ class ImageEdit:
 
     @modal.fastapi_endpoint(method="POST")
     def edit(self, body: dict):
+        import numpy as np
         from PIL import Image as PILImage
 
         image_b64 = body.get("image", "")
@@ -176,23 +178,28 @@ class ImageEdit:
             return {"error": "Missing parameters"}
 
         try:
-            image = PILImage.open(
+            pil_image = PILImage.open(
                 io.BytesIO(base64.b64decode(image_b64))
             ).convert("RGB").resize((1024, 1024))
 
-            print(f"Image size: {image.size}, mode: {image.mode}")
+            mask_pil = self._get_mask(pil_image, object_text)
 
-            mask = self._get_mask(image, object_text)
-
-            if mask is None:
+            if mask_pil is None:
                 return {"error": "לא הצלחתי לזהות את האובייקט. נסה באנגלית, למשל: 'background' או 'shirt'"}
 
-            print(f"Mask size: {mask.size}, mode: {mask.mode}")
+            img_np = np.array(pil_image, dtype=np.uint8)
+            mask_np = np.array(mask_pil, dtype=np.uint8)
+
+            print(f"img_np shape={img_np.shape} dtype={img_np.dtype}")
+            print(f"mask_np shape={mask_np.shape} dtype={mask_np.dtype}")
+
+            clean_image = PILImage.fromarray(img_np)
+            clean_mask = PILImage.fromarray(mask_np, mode="L")
 
             result = self.fill_pipe(
                 prompt=edit_prompt,
-                image=image,
-                mask_image=mask,
+                image=clean_image,
+                mask_image=clean_mask,
                 height=1024,
                 width=1024,
                 guidance_scale=30,
@@ -206,4 +213,4 @@ class ImageEdit:
         except Exception as e:
             tb = traceback.format_exc()
             print(f"FULL ERROR:\n{tb}")
-            return {"error": str(e), "traceback": tb[-500:]}
+            return {"error": str(e), "traceback": tb[-800:]}
