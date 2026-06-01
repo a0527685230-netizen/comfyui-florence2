@@ -48,6 +48,7 @@ class Bot:
             cache_dir="/models/flux-schnell",
             token=os.environ.get("HF_TOKEN"),
         ).to("cuda")
+        vol.commit()
         print("Ready!")
 
     @modal.fastapi_endpoint(method="POST")
