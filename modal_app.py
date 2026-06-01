@@ -117,10 +117,10 @@ class ImageEdit:
         vol.commit()
         print("Edit Ready!")
 
-    def _get_mask(self, image, object_text):
+    def _get_mask(self, image, object_text, invert=False):
         import torch
         import numpy as np
-        from PIL import Image as PILImage, ImageDraw
+        from PIL import Image as PILImage, ImageDraw, ImageFilter
 
         task = "<REFERRING_EXPRESSION_SEGMENTATION>"
         inputs = self.f2_processor(
@@ -164,7 +164,60 @@ class ImageEdit:
         if not found:
             return None
 
+        # קצוות חלקים
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=3))
+
+        if invert:
+            mask_np = np.array(mask)
+            mask_np = 255 - mask_np
+            mask = PILImage.fromarray(mask_np, mode="L")
+
         return mask
+
+    def _get_bbox_mask(self, image, object_text):
+        import torch
+        import numpy as np
+        from PIL import Image as PILImage, ImageDraw
+
+        task = "<OPEN_VOCABULARY_DETECTION>"
+        inputs = self.f2_processor(
+            text=task + object_text,
+            images=image,
+            return_tensors="pt"
+        ).to("cuda")
+        inputs["pixel_values"] = inputs["pixel_values"].to(torch.float16)
+
+        with torch.no_grad():
+            generated_ids = self.f2_model.generate(
+                input_ids=inputs["input_ids"],
+                pixel_values=inputs["pixel_values"],
+                max_new_tokens=1024,
+                num_beams=3,
+                use_cache=False,
+            )
+
+        generated_text = self.f2_processor.batch_decode(
+            generated_ids, skip_special_tokens=False
+        )[0]
+
+        result = self.f2_processor.post_process_generation(
+            generated_text,
+            task=task,
+            image_size=(image.width, image.height),
+        )
+
+        mask = PILImage.new("L", (image.width, image.height), 0)
+        draw = ImageDraw.Draw(mask)
+        found = False
+
+        if result and task in result:
+            bboxes = result[task].get("bboxes", [])
+            for bbox in bboxes:
+                x1, y1, x2, y2 = [int(v) for v in bbox]
+                draw.rectangle([x1, y1, x2, y2], fill=255)
+                found = True
+
+        return mask if found else None
 
     @modal.fastapi_endpoint(method="POST")
     def edit(self, body: dict):
@@ -174,6 +227,8 @@ class ImageEdit:
         image_b64 = body.get("image", "")
         object_text = body.get("object", "")
         edit_prompt = body.get("prompt", "")
+        is_background = body.get("is_background", False)
+        is_add = body.get("is_add", False)
 
         if not image_b64 or not object_text or not edit_prompt:
             return {"error": "Missing parameters"}
@@ -183,7 +238,15 @@ class ImageEdit:
                 io.BytesIO(base64.b64decode(image_b64))
             ).convert("RGB").resize((1024, 1024))
 
-            mask_pil = self._get_mask(pil_image, object_text)
+            if is_background:
+                # זיהוי נושא ראשי + היפוך מסכה
+                main_subject = body.get("main_subject", "person")
+                mask_pil = self._get_mask(pil_image, main_subject, invert=True)
+            elif is_add:
+                # בounding box לאובייקט שמוסיפים
+                mask_pil = self._get_bbox_mask(pil_image, object_text)
+            else:
+                mask_pil = self._get_mask(pil_image, object_text)
 
             if mask_pil is None:
                 return {"error": "לא הצלחתי לזהות את האובייקט. נסה באנגלית, למשל: 'background' או 'shirt'"}
