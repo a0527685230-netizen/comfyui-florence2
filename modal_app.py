@@ -127,6 +127,8 @@ class ImageEdit:
             return_tensors="pt"
         ).to("cuda")
 
+        inputs["pixel_values"] = inputs["pixel_values"].to(torch.float16)
+
         with torch.no_grad():
             generated_ids = self.f2_model.generate(
                 input_ids=inputs["input_ids"],
