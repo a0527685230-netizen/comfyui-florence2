@@ -12,7 +12,7 @@ image = (
         "torch==2.3.1",
         "torchvision==0.18.1",
         "diffusers>=0.32.0",
-        "transformers==4.44.0",
+        "transformers>=4.47.0,<5.0.0",
         "accelerate==0.34.0",
         "safetensors",
         "sentencepiece",
