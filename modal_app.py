@@ -9,11 +9,11 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install(["libgl1-mesa-glx", "libglib2.0-0"])
     .pip_install([
-        "torch==2.3.1",
-        "torchvision==0.18.1",
+        "torch>=2.4.0",
+        "torchvision",
         "diffusers>=0.32.0",
         "transformers>=4.47.0,<5.0.0",
-        "accelerate==0.34.0",
+        "accelerate>=0.34.0",
         "safetensors",
         "sentencepiece",
         "timm",
@@ -27,7 +27,6 @@ image = (
 
 vol = modal.Volume.from_name("bot-models", create_if_missing=True)
 
-# ===== יצירת תמונה מטקסט =====
 @app.cls(
     gpu="A100",
     image=image,
@@ -73,7 +72,6 @@ class Bot:
             return {"error": str(e)}
 
 
-# ===== עריכת תמונה =====
 @app.cls(
     gpu="A100",
     image=image,
