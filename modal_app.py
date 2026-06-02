@@ -21,13 +21,14 @@ vol = modal.Volume.from_name("bot-models", create_if_missing=True)
 
 COLOR_MAP = {
     "red":(220,30,30),"dark red":(139,0,0),"crimson":(220,20,60),
-    "blue":(30,100,220),"dark blue":(0,0,180),"navy":(0,0,80),"light blue":(135,206,235),
-    "green":(34,139,34),"dark green":(0,100,0),"lime":(50,205,50),
-    "yellow":(220,220,0),"gold":(255,215,0),
+    "blue":(30,100,220),"dark blue":(0,0,180),"navy":(0,0,80),
+    "light blue":(135,206,235),"green":(34,139,34),"dark green":(0,100,0),
+    "lime":(50,205,50),"yellow":(220,220,0),"gold":(255,215,0),
     "orange":(230,120,0),"coral":(255,100,80),
     "purple":(128,0,128),"violet":(238,130,238),"pink":(220,90,130),
-    "black":(15,15,15),"white":(240,240,240),"gray":(128,128,128),"grey":(128,128,128),
-    "brown":(100,50,20),"beige":(245,245,220),"cream":(255,253,208),
+    "black":(15,15,15),"white":(240,240,240),
+    "gray":(128,128,128),"grey":(128,128,128),
+    "brown":(100,50,20),"beige":(245,245,220),
     "silver":(192,192,192),"cyan":(0,206,209),"turquoise":(64,224,208),
 }
 
@@ -38,7 +39,7 @@ def _detect_color(text):
     return None
 
 
-# ═══ יצירת תמונה מטקסט ═══════════════════════════════════════════
+# ═══ יצירת תמונה מטקסט (Flux Schnell — לא משתנה) ══════════════
 
 @app.cls(gpu="A100", image=image, volumes={"/models": vol},
          timeout=600, secrets=[modal.Secret.from_name("hf-token")])
@@ -48,7 +49,7 @@ class Bot:
     def setup(self):
         import torch
         from diffusers import FluxPipeline
-        print("Loading Flux Schnell (Bot)...")
+        print("Loading Flux Schnell...")
         self.pipe = FluxPipeline.from_pretrained(
             "black-forest-labs/FLUX.1-schnell",
             torch_dtype=torch.bfloat16,
@@ -61,12 +62,14 @@ class Bot:
     @modal.fastapi_endpoint(method="POST")
     def generate(self, body: dict):
         prompt = body.get("prompt", "")
-        width  = (int(body.get("width", 1024)) // 16) * 16
+        width  = (int(body.get("width",  1024)) // 16) * 16
         height = (int(body.get("height", 1024)) // 16) * 16
         if not prompt: return {"error": "No prompt"}
         try:
-            img = self.pipe(prompt=prompt, width=width, height=height,
-                            num_inference_steps=4, guidance_scale=0.0).images[0]
+            img = self.pipe(
+                prompt=prompt, width=width, height=height,
+                num_inference_steps=4, guidance_scale=0.0,
+            ).images[0]
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=95)
             return {"image": base64.b64encode(buf.getvalue()).decode()}
@@ -74,7 +77,7 @@ class Bot:
             return {"error": str(e)}
 
 
-# ═══ עריכת תמונה ═════════════════════════════════════════════════
+# ═══ עריכת תמונה (SDXL Inpaint — חדש, טוב יותר להסרת בגדים) ════
 
 @app.cls(gpu="A100", image=image, volumes={"/models": vol},
          timeout=600, secrets=[modal.Secret.from_name("hf-token")])
@@ -84,7 +87,7 @@ class ImageEdit:
     def setup(self):
         import torch
         from transformers import AutoProcessor, AutoModelForCausalLM
-        from diffusers import FluxPipeline
+        from diffusers import StableDiffusionXLInpaintPipeline
 
         hf = os.environ.get("HF_TOKEN")
 
@@ -97,11 +100,13 @@ class ImageEdit:
             trust_remote_code=True, cache_dir="/models/florence2",
             token=hf, attn_implementation="eager").to("cuda")
 
-        print("Loading Flux Schnell (Edit)...")
-        self.gen_pipe = FluxPipeline.from_pretrained(
-            "black-forest-labs/FLUX.1-schnell",
-            torch_dtype=torch.bfloat16,
-            cache_dir="/models/flux-schnell", token=hf).to("cuda")
+        print("Loading SDXL Inpaint...")
+        self.inpaint = StableDiffusionXLInpaintPipeline.from_pretrained(
+            "diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
+            torch_dtype=torch.float16,
+            cache_dir="/models/sdxl-inpaint",
+            use_safetensors=True,
+        ).to("cuda")
 
         vol.commit()
         print("Edit Ready!")
@@ -115,7 +120,8 @@ class ImageEdit:
         inp["pixel_values"] = inp["pixel_values"].to(torch.float16)
         with torch.no_grad():
             ids = self.f2_model.generate(
-                input_ids=inp["input_ids"], pixel_values=inp["pixel_values"],
+                input_ids=inp["input_ids"],
+                pixel_values=inp["pixel_values"],
                 max_new_tokens=1024, num_beams=3, use_cache=False)
         txt = self.f2_proc.batch_decode(ids, skip_special_tokens=False)[0]
         return self.f2_proc.post_process_generation(
@@ -151,10 +157,9 @@ class ImageEdit:
                 found = True
         return mask if found else None
 
-    def _get_mask(self, image, target, dilate=8):
+    def _get_mask(self, image, target):
         from PIL import ImageFilter
         import numpy as np
-        # נסה segmentation → bbox → מילה ראשונה
         mask = (self._seg_mask(image, target)
                 or self._bbox_mask(image, target))
         if mask is None:
@@ -163,15 +168,16 @@ class ImageEdit:
                 mask = (self._seg_mask(image, w[0])
                         or self._bbox_mask(image, w[0]))
         if mask is None: return None
-        mask = mask.filter(ImageFilter.MaxFilter(dilate*2+1))
-        mask = mask.filter(ImageFilter.GaussianBlur(4))
+        # דילציה קטנה בלבד — לא להחריג ידיים/פנים
+        mask = mask.filter(ImageFilter.MaxFilter(9))
+        mask = mask.filter(ImageFilter.GaussianBlur(3))
         return mask if np.array(mask).max() > 10 else None
 
     def _get_face_mask(self, image):
         from PIL import ImageFilter
         for q in ["face", "human face"]:
             m = self._bbox_mask(image, q)
-            if m: return m.filter(ImageFilter.MaxFilter(35))
+            if m: return m.filter(ImageFilter.MaxFilter(25))
         return None
 
     # ─── עיבוד תמונה ─────────────────────────────────────────────
@@ -186,13 +192,11 @@ class ImageEdit:
         return P.fromarray((g*m3 + o*(1-m3)).astype(np.uint8))
 
     def _restore_face(self, original, result, face_mask):
-        """פנים מקוריות — תמיד"""
         from PIL import ImageFilter
-        soft = face_mask.filter(ImageFilter.GaussianBlur(6))
+        soft = face_mask.filter(ImageFilter.GaussianBlur(5))
         return self._composite(result, original, soft)
 
     def _apply_color(self, image, mask, rgb):
-        """שינוי צבע ישיר — ללא AI"""
         import numpy as np
         from PIL import Image as P
         img = np.array(image).astype(np.float32) / 255.0
@@ -201,54 +205,36 @@ class ImageEdit:
         cr, cg, cb = [c/255.0 for c in rgb]
         lum = 0.299*img[:,:,0] + 0.587*img[:,:,1] + 0.114*img[:,:,2]
         mx  = max(cr,cg,cb) or 1.0
-        colored = np.stack([lum*(cr/mx), lum*(cg/mx), lum*(cb/mx)], axis=2)
-        colored = np.clip(colored * mx, 0, 1)
-        result  = img*(1-m3) + colored*m3
-        return P.fromarray((np.clip(result,0,1)*255).astype(np.uint8))
+        colored = np.clip(
+            np.stack([lum*(cr/mx), lum*(cg/mx), lum*(cb/mx)], axis=2) * mx,
+            0, 1)
+        return P.fromarray((np.clip(img*(1-m3)+colored*m3,0,1)*255).astype(np.uint8))
 
-    def _match_skin_tone(self, generated, original, mask, face_mask):
-        """התאמת גוון עור לתמונה המקורית"""
-        import numpy as np
-        from PIL import Image as P
-        if face_mask is None: return generated
+    def _build_neg_prompt(self, action, fill_prompt):
+        base = "(worst quality, low quality:1.4), (bad anatomy:1.3), blurry, artifacts, watermark, text"
+        if action == "remove" or any(k in fill_prompt.lower()
+                for k in ["bare","chest","skin","nude","shirtless","topless","naked"]):
+            return base + ", (shirt:1.5), (t-shirt:1.5), (clothing:1.5), fabric, covered, dressed"
+        return base
 
-        orig_np = np.array(original).astype(np.float32)
-        gen_np  = np.array(generated).astype(np.float32)
-        fm = np.array(face_mask).astype(np.float32) / 255.0
-        mk = np.array(mask).astype(np.float32) / 255.0
+    # ─── SDXL Inpaint — הלב של המערכת ───────────────────────────
 
-        if fm.sum() < 50: return generated
-
-        # גוון עור מהפנים המקוריות
-        skin_r = (orig_np[:,:,0]*fm).sum() / fm.sum()
-        skin_g = (orig_np[:,:,1]*fm).sum() / fm.sum()
-        skin_b = (orig_np[:,:,2]*fm).sum() / fm.sum()
-
-        # גוון ממוצע של אזור שנוצר
-        if mk.sum() < 50: return generated
-        gen_r = (gen_np[:,:,0]*mk).sum() / mk.sum()
-        gen_g = (gen_np[:,:,1]*mk).sum() / mk.sum()
-        gen_b = (gen_np[:,:,2]*mk).sum() / mk.sum()
-
-        if gen_r < 1 or gen_g < 1 or gen_b < 1: return generated
-
-        # שינוי גוון
-        adj = gen_np.copy()
-        adj[:,:,0] = np.clip(gen_np[:,:,0] * (skin_r/gen_r), 0, 255)
-        adj[:,:,1] = np.clip(gen_np[:,:,1] * (skin_g/gen_g), 0, 255)
-        adj[:,:,2] = np.clip(gen_np[:,:,2] * (skin_b/gen_b), 0, 255)
-
-        # החל רק באזור המסוכה
-        mk3 = np.stack([mk]*3, axis=2)
-        blended = adj*mk3 + gen_np*(1-mk3)
-        return P.fromarray(blended.astype(np.uint8))
-
-    def _generate(self, prompt):
-        """יצירה מאפס — ללא הקשר, ללא בלבול"""
-        return self.gen_pipe(
-            prompt=prompt, width=1024, height=1024,
-            num_inference_steps=4, guidance_scale=0.0,
+    def _sdxl_edit(self, image, mask, prompt, action):
+        neg = self._build_neg_prompt(action, prompt)
+        print(f"SDXL prompt: {prompt}")
+        print(f"SDXL neg: {neg}")
+        result = self.inpaint(
+            prompt=prompt,
+            negative_prompt=neg,
+            image=image,
+            mask_image=mask,
+            height=1024,
+            width=1024,
+            strength=0.99,
+            guidance_scale=9.0,
+            num_inference_steps=50,
         ).images[0]
+        return result
 
     # ─── endpoint ─────────────────────────────────────────────────
 
@@ -269,14 +255,14 @@ class ImageEdit:
 
         try:
             pil = P.open(io.BytesIO(base64.b64decode(img_b64))).convert("RGB").resize((1024,1024))
-            print(f"action={action} | target={mask_target} | fill={fill_prompt}")
+            print(f"action={action} | target={mask_target} | color={color_name}")
 
             # 1. מסכה
             mask = self._get_mask(pil, mask_target)
             if mask is None:
-                return {"error": f"לא זיהיתי: '{mask_target}'. נסה מילה אחרת."}
+                return {"error": f"לא זיהיתי: '{mask_target}'. נסח אחרת."}
 
-            # 2. פנים מראש
+            # 2. פנים (לשחזור אחר כך)
             face_mask = self._get_face_mask(pil)
 
             # 3. עריכה
@@ -285,18 +271,10 @@ class ImageEdit:
                 if rgb:
                     final = self._apply_color(pil, mask, rgb)
                 else:
-                    gen   = self._generate(fill_prompt)
-                    final = self._composite(pil, gen, mask)
+                    final = self._sdxl_edit(pil, mask, fill_prompt, action)
             else:
-                # יצירה מאפס + חיבור — עובד לכל סוג עריכה
-                gen = self._generate(fill_prompt)
-
-                # התאמת גוון עור אם רלוונטי
-                skin_kw = ("skin","chest","bare","torso","nude","body","legs","arms")
-                if any(k in fill_prompt.lower() for k in skin_kw):
-                    gen = self._match_skin_tone(gen, pil, mask, face_mask)
-
-                final = self._composite(pil, gen, mask)
+                # SDXL Inpaint — רואה הקשר, מתאים עור, עוקב אחרי פרומפט
+                final = self._sdxl_edit(pil, mask, fill_prompt, action)
 
             # 4. פנים מקוריות — תמיד
             if face_mask:
