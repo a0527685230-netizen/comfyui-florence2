@@ -42,9 +42,9 @@ def _is_clothing(text):
     return bool(re.search(
         r'shirt|t-shirt|tshirt|top|blouse|tank|dress|jacket|coat|'
         r'sweater|hoodie|pants|jeans|trousers|skirt|shorts|bra|'
-        r'underwear|bikini|socks|boots|shoes|חולצה|מכנסיים|שמלה|'
-        r'מעיל|חצאית|תחתונים|חזייה|נעליים|גרביים',
-        text.lower()))
+        r'underwear|bikini|socks|boots|shoes|clothing|clothes|garment|'
+        r'outfit|gown|leggings|חולצה|מכנסיים|שמלה|מעיל|חצאית|'
+        r'תחתונים|חזייה|נעליים|גרביים', text.lower()))
 
 
 # ═══ יצירת תמונה מטקסט ══════════════════════════════════════════
@@ -119,8 +119,6 @@ class ImageEdit:
         vol.commit()
         print("Edit Ready!")
 
-    # ─── Florence2 ────────────────────────────────────────────────
-
     def _f2(self, task, text, image):
         import torch
         inp = self.f2_proc(text=task+text, images=image,
@@ -172,16 +170,14 @@ class ImageEdit:
         clothing = _is_clothing(target)
 
         if clothing:
-            # בגדים → bbox מדויק + דילציה קטנה
             mask = self._bbox_mask(image, target)
             if mask is None:
-                words = target.split()
-                mask = self._bbox_mask(image, words[0]) if len(words)>1 else None
+                w = target.split()
+                mask = self._bbox_mask(image, w[0]) if len(w)>1 else None
             if mask is None:
                 mask = self._seg_mask(image, target)
             dilation = 5
         else:
-            # שאר → segmentation (רקע, חפצים וכו')
             mask = self._seg_mask(image, target)
             if mask is None:
                 mask = self._bbox_mask(image, target)
@@ -198,8 +194,6 @@ class ImageEdit:
             m = self._bbox_mask(image, q)
             if m: return m.filter(ImageFilter.MaxFilter(25))
         return None
-
-    # ─── עיבוד תמונה ─────────────────────────────────────────────
 
     def _composite(self, original, generated, mask):
         import numpy as np
@@ -221,12 +215,11 @@ class ImageEdit:
         img = np.array(image).astype(np.float32) / 255.0
         m   = np.array(mask).astype(np.float32) / 255.0
         m3  = np.stack([m]*3, axis=2)
-        cr, cg, cb = [c/255.0 for c in rgb]
+        cr,cg,cb = [c/255.0 for c in rgb]
         lum = 0.299*img[:,:,0] + 0.587*img[:,:,1] + 0.114*img[:,:,2]
         mx  = max(cr,cg,cb) or 1.0
         colored = np.clip(
-            np.stack([lum*(cr/mx), lum*(cg/mx), lum*(cb/mx)], axis=2)*mx,
-            0, 1)
+            np.stack([lum*(cr/mx), lum*(cg/mx), lum*(cb/mx)], axis=2)*mx, 0, 1)
         return P.fromarray(
             (np.clip(img*(1-m3)+colored*m3,0,1)*255).astype(np.uint8))
 
@@ -240,20 +233,18 @@ class ImageEdit:
 
     def _sdxl_edit(self, image, mask, prompt, action):
         neg = self._build_neg(action, prompt)
-        print(f"SDXL | prompt={prompt}")
+        print(f"SDXL | action={action} | prompt={prompt}")
         result = self.inpaint(
             prompt=prompt,
             negative_prompt=neg,
             image=image,
             mask_image=mask,
             height=1024, width=1024,
-            strength=0.99,
+            strength=0.88,
             guidance_scale=9.0,
             num_inference_steps=50,
         ).images[0]
         return result
-
-    # ─── endpoint ─────────────────────────────────────────────────
 
     @modal.fastapi_endpoint(method="POST")
     def edit(self, body: dict):
@@ -276,7 +267,7 @@ class ImageEdit:
 
             mask = self._get_mask(pil, mask_target)
             if mask is None:
-                return {"error": f"לא זיהיתי: '{mask_target}'"}
+                return {"error": f"לא זיהיתי: '{mask_target}'. נסה לנסח אחרת."}
 
             face_mask = self._get_face_mask(pil)
 
