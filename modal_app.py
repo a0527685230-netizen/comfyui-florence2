@@ -117,9 +117,8 @@ class ImageEdit:
         vol.commit()
         print("Edit Ready!")
 
-    def _get_mask(self, image, object_text, invert=False):
+    def _get_segmentation_mask(self, image, object_text):
         import torch
-        import numpy as np
         from PIL import Image as PILImage, ImageDraw, ImageFilter
 
         task = "<REFERRING_EXPRESSION_SEGMENTATION>"
@@ -164,19 +163,11 @@ class ImageEdit:
         if not found:
             return None
 
-        # קצוות חלקים
-        mask = mask.filter(ImageFilter.GaussianBlur(radius=3))
-
-        if invert:
-            mask_np = np.array(mask)
-            mask_np = 255 - mask_np
-            mask = PILImage.fromarray(mask_np, mode="L")
-
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=4))
         return mask
 
     def _get_bbox_mask(self, image, object_text):
         import torch
-        import numpy as np
         from PIL import Image as PILImage, ImageDraw
 
         task = "<OPEN_VOCABULARY_DETECTION>"
@@ -211,13 +202,23 @@ class ImageEdit:
         found = False
 
         if result and task in result:
-            bboxes = result[task].get("bboxes", [])
-            for bbox in bboxes:
+            for bbox in result[task].get("bboxes", []):
                 x1, y1, x2, y2 = [int(v) for v in bbox]
                 draw.rectangle([x1, y1, x2, y2], fill=255)
                 found = True
 
         return mask if found else None
+
+    def _composite(self, original, generated, mask):
+        import numpy as np
+        from PIL import Image as PILImage
+
+        orig_np = np.array(original).astype(np.float32)
+        gen_np = np.array(generated).astype(np.float32)
+        mask_np = np.array(mask).astype(np.float32) / 255.0
+        mask_3ch = np.stack([mask_np, mask_np, mask_np], axis=2)
+        result_np = (gen_np * mask_3ch + orig_np * (1 - mask_3ch)).astype(np.uint8)
+        return PILImage.fromarray(result_np)
 
     @modal.fastapi_endpoint(method="POST")
     def edit(self, body: dict):
@@ -225,12 +226,13 @@ class ImageEdit:
         from PIL import Image as PILImage
 
         image_b64 = body.get("image", "")
-        object_text = body.get("object", "")
-        edit_prompt = body.get("prompt", "")
-        is_background = body.get("is_background", False)
-        is_add = body.get("is_add", False)
+        mask_target = body.get("mask_target", "")
+        fill_prompt = body.get("fill_prompt", "")
+        action = body.get("action", "change")
+        orig_width = body.get("orig_width", 1024)
+        orig_height = body.get("orig_height", 1024)
 
-        if not image_b64 or not object_text or not edit_prompt:
+        if not image_b64 or not mask_target or not fill_prompt:
             return {"error": "Missing parameters"}
 
         try:
@@ -238,26 +240,25 @@ class ImageEdit:
                 io.BytesIO(base64.b64decode(image_b64))
             ).convert("RGB").resize((1024, 1024))
 
-            if is_background:
-                # זיהוי נושא ראשי + היפוך מסכה
-                main_subject = body.get("main_subject", "person")
-                mask_pil = self._get_mask(pil_image, main_subject, invert=True)
-            elif is_add:
-                # בounding box לאובייקט שמוסיפים
-                mask_pil = self._get_bbox_mask(pil_image, object_text)
+            print(f"Action: {action} | Target: {mask_target} | Fill: {fill_prompt}")
+
+            if action == "add":
+                mask_pil = self._get_bbox_mask(pil_image, mask_target)
             else:
-                mask_pil = self._get_mask(pil_image, object_text)
+                mask_pil = self._get_segmentation_mask(pil_image, mask_target)
+                if mask_pil is None:
+                    mask_pil = self._get_bbox_mask(pil_image, mask_target)
 
             if mask_pil is None:
-                return {"error": "לא הצלחתי לזהות את האובייקט. נסה באנגלית, למשל: 'background' או 'shirt'"}
+                return {"error": "לא הצלחתי לזהות את האובייקט: " + mask_target}
 
             img_np = np.array(pil_image, dtype=np.uint8)
             mask_np = np.array(mask_pil, dtype=np.uint8)
             clean_image = PILImage.fromarray(img_np)
             clean_mask = PILImage.fromarray(mask_np, mode="L")
 
-            result = self.fill_pipe(
-                prompt=edit_prompt,
+            generated = self.fill_pipe(
+                prompt=fill_prompt,
                 image=clean_image,
                 mask_image=clean_mask,
                 height=1024,
@@ -266,11 +267,18 @@ class ImageEdit:
                 num_inference_steps=50,
             ).images[0]
 
+            # חיבור חזרה — רק האזור שנשתנה
+            final = self._composite(pil_image, generated, mask_pil)
+
+            # החזרה לגודל המקורי
+            if orig_width != 1024 or orig_height != 1024:
+                final = final.resize((orig_width, orig_height), PILImage.LANCZOS)
+
             buf = io.BytesIO()
-            result.save(buf, format="JPEG", quality=95)
+            final.save(buf, format="JPEG", quality=95)
             return {"image": base64.b64encode(buf.getvalue()).decode()}
 
         except Exception as e:
             tb = traceback.format_exc()
-            print(f"FULL ERROR:\n{tb}")
-            return {"error": str(e), "traceback": tb[-800:]}
+            print(f"ERROR:\n{tb}")
+            return {"error": str(e), "traceback": tb[-500:]}
