@@ -1,4 +1,4 @@
-import modal, io, base64, os, traceback
+import modal, io, base64, os, traceback, re
 
 app = modal.App("telegram-bot")
 
@@ -38,8 +38,16 @@ def _detect_color(text):
         if name in t: return rgb
     return None
 
+def _is_clothing(text):
+    return bool(re.search(
+        r'shirt|t-shirt|tshirt|top|blouse|tank|dress|jacket|coat|'
+        r'sweater|hoodie|pants|jeans|trousers|skirt|shorts|bra|'
+        r'underwear|bikini|socks|boots|shoes|חולצה|מכנסיים|שמלה|'
+        r'מעיל|חצאית|תחתונים|חזייה|נעליים|גרביים',
+        text.lower()))
 
-# ═══ יצירת תמונה מטקסט (Flux Schnell — לא משתנה) ══════════════
+
+# ═══ יצירת תמונה מטקסט ══════════════════════════════════════════
 
 @app.cls(gpu="A100", image=image, volumes={"/models": vol},
          timeout=600, secrets=[modal.Secret.from_name("hf-token")])
@@ -77,7 +85,7 @@ class Bot:
             return {"error": str(e)}
 
 
-# ═══ עריכת תמונה (SDXL Inpaint — חדש, טוב יותר להסרת בגדים) ════
+# ═══ עריכת תמונה ════════════════════════════════════════════════
 
 @app.cls(gpu="A100", image=image, volumes={"/models": vol},
          timeout=600, secrets=[modal.Secret.from_name("hf-token")])
@@ -160,16 +168,27 @@ class ImageEdit:
     def _get_mask(self, image, target):
         from PIL import ImageFilter
         import numpy as np
-        mask = (self._seg_mask(image, target)
-                or self._bbox_mask(image, target))
-        if mask is None:
-            w = target.split()
-            if len(w) > 1:
-                mask = (self._seg_mask(image, w[0])
-                        or self._bbox_mask(image, w[0]))
+
+        clothing = _is_clothing(target)
+
+        if clothing:
+            # בגדים → bbox מדויק + דילציה קטנה
+            mask = self._bbox_mask(image, target)
+            if mask is None:
+                words = target.split()
+                mask = self._bbox_mask(image, words[0]) if len(words)>1 else None
+            if mask is None:
+                mask = self._seg_mask(image, target)
+            dilation = 5
+        else:
+            # שאר → segmentation (רקע, חפצים וכו')
+            mask = self._seg_mask(image, target)
+            if mask is None:
+                mask = self._bbox_mask(image, target)
+            dilation = 10
+
         if mask is None: return None
-        # דילציה קטנה בלבד — לא להחריג ידיים/פנים
-        mask = mask.filter(ImageFilter.MaxFilter(9))
+        mask = mask.filter(ImageFilter.MaxFilter(dilation*2+1))
         mask = mask.filter(ImageFilter.GaussianBlur(3))
         return mask if np.array(mask).max() > 10 else None
 
@@ -206,30 +225,28 @@ class ImageEdit:
         lum = 0.299*img[:,:,0] + 0.587*img[:,:,1] + 0.114*img[:,:,2]
         mx  = max(cr,cg,cb) or 1.0
         colored = np.clip(
-            np.stack([lum*(cr/mx), lum*(cg/mx), lum*(cb/mx)], axis=2) * mx,
+            np.stack([lum*(cr/mx), lum*(cg/mx), lum*(cb/mx)], axis=2)*mx,
             0, 1)
-        return P.fromarray((np.clip(img*(1-m3)+colored*m3,0,1)*255).astype(np.uint8))
+        return P.fromarray(
+            (np.clip(img*(1-m3)+colored*m3,0,1)*255).astype(np.uint8))
 
-    def _build_neg_prompt(self, action, fill_prompt):
+    def _build_neg(self, action, fill_prompt):
         base = "(worst quality, low quality:1.4), (bad anatomy:1.3), blurry, artifacts, watermark, text"
-        if action == "remove" or any(k in fill_prompt.lower()
-                for k in ["bare","chest","skin","nude","shirtless","topless","naked"]):
-            return base + ", (shirt:1.5), (t-shirt:1.5), (clothing:1.5), fabric, covered, dressed"
+        fp = fill_prompt.lower()
+        if action=="remove" or any(k in fp for k in
+                ["bare","chest","skin","nude","shirtless","topless","naked","legs"]):
+            return base+", (shirt:1.5),(t-shirt:1.5),(clothing:1.5),fabric,covered,dressed"
         return base
 
-    # ─── SDXL Inpaint — הלב של המערכת ───────────────────────────
-
     def _sdxl_edit(self, image, mask, prompt, action):
-        neg = self._build_neg_prompt(action, prompt)
-        print(f"SDXL prompt: {prompt}")
-        print(f"SDXL neg: {neg}")
+        neg = self._build_neg(action, prompt)
+        print(f"SDXL | prompt={prompt}")
         result = self.inpaint(
             prompt=prompt,
             negative_prompt=neg,
             image=image,
             mask_image=mask,
-            height=1024,
-            width=1024,
+            height=1024, width=1024,
             strength=0.99,
             guidance_scale=9.0,
             num_inference_steps=50,
@@ -255,32 +272,23 @@ class ImageEdit:
 
         try:
             pil = P.open(io.BytesIO(base64.b64decode(img_b64))).convert("RGB").resize((1024,1024))
-            print(f"action={action} | target={mask_target} | color={color_name}")
+            print(f"action={action} | target={mask_target}")
 
-            # 1. מסכה
             mask = self._get_mask(pil, mask_target)
             if mask is None:
-                return {"error": f"לא זיהיתי: '{mask_target}'. נסח אחרת."}
+                return {"error": f"לא זיהיתי: '{mask_target}'"}
 
-            # 2. פנים (לשחזור אחר כך)
             face_mask = self._get_face_mask(pil)
 
-            # 3. עריכה
             if action == "color" and color_name:
                 rgb = _detect_color(color_name)
-                if rgb:
-                    final = self._apply_color(pil, mask, rgb)
-                else:
-                    final = self._sdxl_edit(pil, mask, fill_prompt, action)
+                final = self._apply_color(pil, mask, rgb) if rgb else self._sdxl_edit(pil, mask, fill_prompt, action)
             else:
-                # SDXL Inpaint — רואה הקשר, מתאים עור, עוקב אחרי פרומפט
                 final = self._sdxl_edit(pil, mask, fill_prompt, action)
 
-            # 4. פנים מקוריות — תמיד
             if face_mask:
                 final = self._restore_face(pil, final, face_mask)
 
-            # 5. גודל מקורי
             if orig_w > 0 and orig_h > 0 and (orig_w != 1024 or orig_h != 1024):
                 final = final.resize((orig_w, orig_h), P.LANCZOS)
 
