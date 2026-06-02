@@ -28,6 +28,7 @@ image = (
 
 vol = modal.Volume.from_name("bot-models", create_if_missing=True)
 
+
 @app.cls(
     gpu="A100",
     image=image,
@@ -54,8 +55,11 @@ class Bot:
     @modal.fastapi_endpoint(method="POST")
     def generate(self, body: dict):
         prompt = body.get("prompt", "")
-        width = body.get("width", 1024)
-        height = body.get("height", 1024)
+        width = int(body.get("width", 1024))
+        height = int(body.get("height", 1024))
+        # Flux requires multiples of 16
+        width = (width // 16) * 16
+        height = (height // 16) * 16
         if not prompt:
             return {"error": "No prompt"}
         try:
@@ -117,18 +121,14 @@ class ImageEdit:
         vol.commit()
         print("Edit Ready!")
 
-    def _get_segmentation_mask(self, image, object_text):
+    def _run_florence2(self, task, text, image):
         import torch
-        from PIL import Image as PILImage, ImageDraw, ImageFilter
-
-        task = "<REFERRING_EXPRESSION_SEGMENTATION>"
         inputs = self.f2_processor(
-            text=task + object_text,
+            text=task + text,
             images=image,
             return_tensors="pt"
         ).to("cuda")
         inputs["pixel_values"] = inputs["pixel_values"].to(torch.float16)
-
         with torch.no_grad():
             generated_ids = self.f2_model.generate(
                 input_ids=inputs["input_ids"],
@@ -137,88 +137,112 @@ class ImageEdit:
                 num_beams=3,
                 use_cache=False,
             )
-
         generated_text = self.f2_processor.batch_decode(
             generated_ids, skip_special_tokens=False
         )[0]
-
-        result = self.f2_processor.post_process_generation(
+        return self.f2_processor.post_process_generation(
             generated_text,
             task=task,
             image_size=(image.width, image.height),
         )
 
-        mask = PILImage.new("L", (image.width, image.height), 0)
-        draw = ImageDraw.Draw(mask)
-        found = False
-
-        if result and task in result:
-            for polygon_group in result[task].get("polygons", []):
-                for polygon in polygon_group:
-                    if len(polygon) >= 6:
-                        points = [(polygon[j], polygon[j+1]) for j in range(0, len(polygon), 2)]
-                        draw.polygon(points, fill=255)
-                        found = True
-
-        if not found:
-            return None
-
-        mask = mask.filter(ImageFilter.GaussianBlur(radius=4))
-        return mask
-
-    def _get_bbox_mask(self, image, object_text):
-        import torch
+    def _segmentation_mask(self, image, text):
         from PIL import Image as PILImage, ImageDraw
-
-        task = "<OPEN_VOCABULARY_DETECTION>"
-        inputs = self.f2_processor(
-            text=task + object_text,
-            images=image,
-            return_tensors="pt"
-        ).to("cuda")
-        inputs["pixel_values"] = inputs["pixel_values"].to(torch.float16)
-
-        with torch.no_grad():
-            generated_ids = self.f2_model.generate(
-                input_ids=inputs["input_ids"],
-                pixel_values=inputs["pixel_values"],
-                max_new_tokens=1024,
-                num_beams=3,
-                use_cache=False,
-            )
-
-        generated_text = self.f2_processor.batch_decode(
-            generated_ids, skip_special_tokens=False
-        )[0]
-
-        result = self.f2_processor.post_process_generation(
-            generated_text,
-            task=task,
-            image_size=(image.width, image.height),
-        )
-
+        task = "<REFERRING_EXPRESSION_SEGMENTATION>"
+        result = self._run_florence2(task, text, image)
         mask = PILImage.new("L", (image.width, image.height), 0)
         draw = ImageDraw.Draw(mask)
         found = False
+        if result and task in result:
+            for pg in result[task].get("polygons", []):
+                for polygon in pg:
+                    if len(polygon) >= 6:
+                        pts = [(polygon[j], polygon[j+1]) for j in range(0, len(polygon), 2)]
+                        draw.polygon(pts, fill=255)
+                        found = True
+        return mask if found else None
 
+    def _bbox_mask(self, image, text):
+        from PIL import Image as PILImage, ImageDraw
+        task = "<OPEN_VOCABULARY_DETECTION>"
+        result = self._run_florence2(task, text, image)
+        mask = PILImage.new("L", (image.width, image.height), 0)
+        draw = ImageDraw.Draw(mask)
+        found = False
         if result and task in result:
             for bbox in result[task].get("bboxes", []):
                 x1, y1, x2, y2 = [int(v) for v in bbox]
                 draw.rectangle([x1, y1, x2, y2], fill=255)
                 found = True
-
         return mask if found else None
+
+    def _dilate_mask(self, mask, pixels=10):
+        from PIL import ImageFilter
+        return mask.filter(ImageFilter.MaxFilter(size=pixels * 2 + 1))
+
+    def _subtract_mask(self, base_mask, exclude_mask):
+        import numpy as np
+        from PIL import Image as PILImage
+        b = np.array(base_mask).astype(np.float32)
+        e = np.array(exclude_mask).astype(np.float32)
+        result = np.clip(b - e * 2.0, 0, 255).astype(np.uint8)
+        return PILImage.fromarray(result, mode="L")
+
+    def _is_near_face_item(self, text):
+        t = text.lower()
+        return bool(__import__('re').search(
+            r'shirt|t-shirt|tshirt|top|blouse|dress|jacket|coat|'
+            r'sweater|hoodie|tank|בגד|חולצה|שמלה|מעיל|סוודר', t))
+
+    def _get_mask(self, image, mask_target, action):
+        import numpy as np
+        from PIL import Image as PILImage, ImageFilter
+
+        # נסה segmentation קודם, אחר כך bbox
+        mask = self._segmentation_mask(image, mask_target)
+        if mask is None:
+            mask = self._bbox_mask(image, mask_target)
+        if mask is None:
+            # נסה מילה אחת בלבד אם הקלט ארוך
+            words = mask_target.split()
+            if len(words) > 1:
+                mask = self._segmentation_mask(image, words[0])
+                if mask is None:
+                    mask = self._bbox_mask(image, words[0])
+        if mask is None:
+            return None
+
+        # הרחב קצת את המסכה לכסות שפות
+        mask = self._dilate_mask(mask, pixels=6)
+
+        # הסר בגדים — החרג פנים מהמסכה
+        if action == "remove" and self._is_near_face_item(mask_target):
+            face_mask = self._bbox_mask(image, "face")
+            if face_mask is None:
+                face_mask = self._bbox_mask(image, "person face head")
+            if face_mask:
+                face_dilated = self._dilate_mask(face_mask, pixels=20)
+                mask = self._subtract_mask(mask, face_dilated)
+
+        # blur לשוליים חלקים
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=3))
+
+        # וידוי שהמסכה לא ריקה אחרי ההחרגה
+        arr = __import__('numpy').array(mask)
+        if arr.max() < 10:
+            return None
+
+        return mask
 
     def _composite(self, original, generated, mask):
         import numpy as np
         from PIL import Image as PILImage
-
-        orig_np = np.array(original).astype(np.float32)
-        gen_np = np.array(generated).astype(np.float32)
-        mask_np = np.array(mask).astype(np.float32) / 255.0
-        mask_3ch = np.stack([mask_np, mask_np, mask_np], axis=2)
-        result_np = (gen_np * mask_3ch + orig_np * (1 - mask_3ch)).astype(np.uint8)
-        return PILImage.fromarray(result_np)
+        o = np.array(original).astype(np.float32)
+        g = np.array(generated).astype(np.float32)
+        m = np.array(mask).astype(np.float32) / 255.0
+        m3 = np.stack([m, m, m], axis=2)
+        result = (g * m3 + o * (1 - m3)).astype(np.uint8)
+        return PILImage.fromarray(result)
 
     @modal.fastapi_endpoint(method="POST")
     def edit(self, body: dict):
@@ -229,8 +253,8 @@ class ImageEdit:
         mask_target = body.get("mask_target", "")
         fill_prompt = body.get("fill_prompt", "")
         action = body.get("action", "change")
-        orig_width = body.get("orig_width", 1024)
-        orig_height = body.get("orig_height", 1024)
+        orig_width = int(body.get("orig_width", 1024))
+        orig_height = int(body.get("orig_height", 1024))
 
         if not image_b64 or not mask_target or not fill_prompt:
             return {"error": "Missing parameters"}
@@ -240,17 +264,23 @@ class ImageEdit:
                 io.BytesIO(base64.b64decode(image_b64))
             ).convert("RGB").resize((1024, 1024))
 
-            print(f"Action: {action} | Target: {mask_target} | Fill: {fill_prompt}")
+            print(f"Action={action} Target={mask_target} Fill={fill_prompt}")
 
-            if action == "add":
-                mask_pil = self._get_bbox_mask(pil_image, mask_target)
-            else:
-                mask_pil = self._get_segmentation_mask(pil_image, mask_target)
-                if mask_pil is None:
-                    mask_pil = self._get_bbox_mask(pil_image, mask_target)
+            mask_pil = self._get_mask(pil_image, mask_target, action)
 
             if mask_pil is None:
-                return {"error": "לא הצלחתי לזהות את האובייקט: " + mask_target}
+                return {"error": "לא הצלחתי לזהות: " + mask_target + ". נסה לנסח אחרת."}
+
+            # פרמטרים לפי סוג פעולה
+            if action == "remove":
+                steps = 70
+                guidance = 50
+            elif action == "add":
+                steps = 50
+                guidance = 30
+            else:
+                steps = 50
+                guidance = 35
 
             img_np = np.array(pil_image, dtype=np.uint8)
             mask_np = np.array(mask_pil, dtype=np.uint8)
@@ -263,15 +293,14 @@ class ImageEdit:
                 mask_image=clean_mask,
                 height=1024,
                 width=1024,
-                guidance_scale=30,
-                num_inference_steps=50,
+                guidance_scale=guidance,
+                num_inference_steps=steps,
             ).images[0]
 
-            # חיבור חזרה — רק האזור שנשתנה
             final = self._composite(pil_image, generated, mask_pil)
 
             # החזרה לגודל המקורי
-            if orig_width != 1024 or orig_height != 1024:
+            if orig_width > 0 and orig_height > 0:
                 final = final.resize((orig_width, orig_height), PILImage.LANCZOS)
 
             buf = io.BytesIO()
